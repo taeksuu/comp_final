@@ -17,6 +17,9 @@ $(TARGET): $(OBJECTS)
 %.o: %.cpp
 	$(CXX) $(CFLAGS) -c -o $@ $^
 
+translator.o: translator.cpp
+	$(CUX) $(CUDA_CFLAGS) -c -o $@ -x cu $^
+
 %.o: %.cu
 	$(CUX) $(CUDA_CFLAGS) -c -o $@ $^
 

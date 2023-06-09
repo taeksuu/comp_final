@@ -3,6 +3,16 @@
 #include <mpi.h>
 #include <math.h>
 
+//Error handling using functions of the CUDA runtime API
+#define cudaCheckError() {                                                              \
+  cudaError_t e=cudaGetLastError();                                                   \
+  if(e!=cudaSuccess) {                                                                \
+      printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(e));   \
+      cudaDeviceReset();                                                              \
+      exit(EXIT_FAILURE);                                                             \
+  }                                                                                   \
+}
+
 static int SOS_token = 0;
 static int EOS_token = 1;
 static int HIDDEN_SIZE = 256;
@@ -288,13 +298,54 @@ void matvec(Tensor *input, Tensor *weight, Tensor *output) {
  * @param [in2] input2
  * @param [out] output
  */
-void elemwise_add(Tensor *input1, Tensor *input2, Tensor *output){
-  int N_ = input1->num_elem();
-  
-  for (int n=0; n<N_; ++n) {
-    output->buf[n] = input1->buf[n] + input2->buf[n];
+__global__ void elemwise_add_kernel(float* input1, float* input2, float* output, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) {
+    output[idx] = input1[idx] + input2[idx];
+    // printf("%f", output[idx]);
   }
 }
+
+void elemwise_add(Tensor* input1, Tensor* input2, Tensor* output) {
+  int N = input1->num_elem();
+  int NUM_GPUS;
+  cudaGetDeviceCount(&NUM_GPUS);
+
+  // Allocate GPU memory
+  float* d_input1;
+  float* d_input2;
+  float* d_output;
+  cudaMalloc((void**)&d_input1, N * sizeof(float));
+  cudaMalloc((void**)&d_input2, N * sizeof(float));
+  cudaMalloc((void**)&d_output, N * sizeof(float));
+
+  // Copy input tensors from CPU to GPU
+  cudaMemcpy(d_input1, input1->buf, N * sizeof(float), cudaMemcpyHostToDevice);
+  cudaCheckError();
+  cudaMemcpy(d_input2, input2->buf, N * sizeof(float), cudaMemcpyHostToDevice);
+  cudaCheckError();
+
+  // Launch CUDA kernel
+  int block_size = 256;
+  int num_blocks = (N + block_size - 1) / block_size;
+  elemwise_add_kernel<<<num_blocks, block_size>>>(d_input1, d_input2, d_output, N);
+
+  // Copy the result back from GPU to CPU
+  cudaMemcpy(output->buf, d_output, N * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Free GPU memory
+  cudaFree(d_input1);
+  cudaFree(d_input2);
+  cudaFree(d_output);
+}
+
+// void elemwise_add(Tensor *input1, Tensor *input2, Tensor *output){
+//   int N_ = input1->num_elem();
+  
+//   for (int n=0; n<N_; ++n) {
+//     output->buf[n] = input1->buf[n] + input2->buf[n];
+//   }
+// }
 
 /*
  * elemwise_sigmoid
