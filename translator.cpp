@@ -127,6 +127,9 @@ void translator(Tensor *input, Tensor *output, int N){
   int mpi_rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   if (mpi_rank == 0) {
+
+    // batching
+    // int batch_size = 16;
     
     // N sentences 
     for (int n=0; n<N; ++n) {
@@ -457,18 +460,64 @@ void concat(Tensor *input1, Tensor *input2, Tensor *output) {
  * @param [in3] bias   : a vector of size [N_]
  * @param [out] output : a vector of size [N_]
  */
-void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
-  int K_ = weight->shape[1];
-  int N_ = weight->shape[0];
-  
-  for (int n=0; n<N_; ++n) {
-    float c = bias->buf[n];
-    for (int k=0; k<K_; ++k) {
-      c += input->buf[k] * weight->buf[n*K_ + k]; 
+
+__global__ void linear_kernel(float* input, float* weight, float* bias, float* output, int N, int K) {
+  int n = blockIdx.x * blockDim.x + threadIdx.x;
+  if (n < N) {
+    float c = bias[n];
+    for (int k = 0; k < K; ++k) {
+      c += input[k] * weight[n * K + k];
     }
-    output->buf[n] = c;
+    output[n] = c;
   }
 }
+
+void linear(Tensor* input, Tensor* weight, Tensor* bias, Tensor* output) {
+  int N = weight->shape[0];
+  int K = weight->shape[1];
+
+  // Allocate GPU memory
+  float* d_input;
+  float* d_weight;
+  float* d_bias;
+  float* d_output;
+  cudaMalloc((void**)&d_input, K * sizeof(float));
+  cudaMalloc((void**)&d_weight, N * K * sizeof(float));
+  cudaMalloc((void**)&d_bias, N * sizeof(float));
+  cudaMalloc((void**)&d_output, N * sizeof(float));
+
+  // Copy input tensors from CPU to GPU
+  cudaMemcpy(d_input, input->buf, K * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_weight, weight->buf, N * K * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_bias, bias->buf, N * sizeof(float), cudaMemcpyHostToDevice);
+
+  // Launch CUDA kernel
+  int block_size = 256;
+  int num_blocks = (N + block_size - 1) / block_size;
+  linear_kernel<<<num_blocks, block_size>>>(d_input, d_weight, d_bias, d_output, N, K);
+
+  // Copy the result back from GPU to CPU
+  cudaMemcpy(output->buf, d_output, N * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Free GPU memory
+  cudaFree(d_input);
+  cudaFree(d_weight);
+  cudaFree(d_bias);
+  cudaFree(d_output);
+}
+
+// void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
+//   int K_ = weight->shape[1];
+//   int N_ = weight->shape[0];
+  
+//   for (int n=0; n<N_; ++n) {
+//     float c = bias->buf[n];
+//     for (int k=0; k<K_; ++k) {
+//       c += input->buf[k] * weight->buf[n*K_ + k]; 
+//     }
+//     output->buf[n] = c;
+//   }
+// }
 
 /*
  * softmax
