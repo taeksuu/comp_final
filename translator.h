@@ -46,8 +46,13 @@ struct Tensor {
   ~Tensor();
   int num_elem();
   void fill_zeros();
+  void print();
+  void cpu2gpu();
+  void gpu2cpu();
 
   float *buf = nullptr;
+  float *bufgpu = nullptr;
+  
   int ndim = 0;
   int shape[4];
 };

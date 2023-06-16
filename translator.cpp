@@ -2,8 +2,11 @@
 #include "util.h"
 #include <mpi.h>
 #include <math.h>
+#include <vector>
 
-//Error handling using functions of the CUDA runtime API
+#define BATCH_SIZE 16
+#define BLOCK_SIZE 1
+
 #define cudaCheckError() {                                                              \
   cudaError_t e=cudaGetLastError();                                                   \
   if(e!=cudaSuccess) {                                                                \
@@ -67,6 +70,15 @@ void Tensor::fill_zeros() {
   }
 }
 
+void Tensor::print() {
+  int N_ = num_elem();
+  for (int n=0; n<N_; ++n) { 
+    cout << buf[n] << " "; 
+  }
+  cout << endl;
+  cout << endl;
+}
+
 // Parameters
 Tensor *eW_emb;
 Tensor *eW_ir, *eW_iz, *eW_in;
@@ -99,14 +111,14 @@ Tensor *decoder_htmp1, *decoder_htmp2, *decoder_htmp3, *decoder_ht;
 Tensor *decoder_out, *decoder_logsoftmax;
 
 // Operations
-void embedding(int ei, Tensor *weight, Tensor *output);
+void embedding(int *ei, Tensor *weight, Tensor *output);
 void matvec(Tensor *input, Tensor *weight, Tensor *output);
 void elemwise_add(Tensor *input1, Tensor *input2, Tensor *output);
 void elemwise_sigmoid(Tensor *input, Tensor *output);
 void elemwise_tanh(Tensor *input, Tensor *output);
 void elemwise_mult(Tensor *input1, Tensor *input2, Tensor *output);
 void elemwise_oneminus(Tensor *input, Tensor *output);
-void copy_encoder_outputs(Tensor *input, Tensor *output, int i);
+void copy_encoder_outputs(Tensor *input, Tensor *output, int i, int len);
 void concat(Tensor *input1, Tensor *input2, Tensor *output);
 void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output);
 void softmax(Tensor *input, Tensor *output);
@@ -114,6 +126,22 @@ void bmm(Tensor *input, Tensor *weight, Tensor *output);
 void relu(Tensor *input, Tensor *output);
 int  top_one(Tensor *input);
 void log_softmax(Tensor *input, Tensor *output);
+
+void matvec_batch_memcpy(Tensor *input, Tensor *weight, Tensor *output);
+void matvec_batch(Tensor *input, Tensor *weight, Tensor *output);
+void elemwise_add_batch(Tensor *input1, Tensor *input2, Tensor *output);
+void elemwise_sigmoid_batch(Tensor *input, Tensor *output);
+void elemwise_tanh_batch(Tensor *input, Tensor *output);
+void elemwise_mult_batch(Tensor *input1, Tensor *input2, Tensor *output);
+void elemwise_oneminus_batch(Tensor *input, Tensor *output);
+void copy_encoder_outputs_batch(Tensor *input, Tensor *output, int i, int len);
+void concat_batch(Tensor *input1, Tensor *input2, Tensor *output);
+void linear_batch(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output);
+void softmax_batch(Tensor *input, Tensor *output);
+void bmm_batch(Tensor *input, Tensor *weight, Tensor *output);
+void relu_batch(Tensor *input, Tensor *output);
+int  top_one_batch(Tensor *input);
+void log_softmax_batch(Tensor *input, Tensor *output);
 
 /*
  * translator 
@@ -128,82 +156,142 @@ void translator(Tensor *input, Tensor *output, int N){
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
   if (mpi_rank == 0) {
 
-    // batching
-    // int batch_size = 16;
-    
     // N sentences 
-    for (int n=0; n<N; ++n) {
-      
+    for (int n=0; n<N / BATCH_SIZE + 1; ++n) {
+
       // Encoder init
       int input_length = 0;
       for (int i=0; i<MAX_LENGTH; ++i, ++input_length) {
         if (input->buf[n * MAX_LENGTH + i] == 0.0) break;
       }
+
+      int *lengths = (int *) malloc(sizeof(int) * BATCH_SIZE);
+      // input->print();
+      for (int batch_idx=0; batch_idx<BATCH_SIZE; ++batch_idx) {
+        int length = 0;
+        for (int i=0; i<MAX_LENGTH; ++i, ++length) {
+          if (input->buf[n * BATCH_SIZE + batch_idx * MAX_LENGTH + i] == 0.0) {
+            break;
+          }
+        }
+        lengths[batch_idx] = length;
+      }
+
       encoder_hidden->fill_zeros();
       encoder_outputs->fill_zeros();
 
       // Encoder
-      for (int i=0; i<input_length; ++i) {
-        
+      // for (int i=0; i<input_length; ++i) {
+      for (int i=0; i<MAX_LENGTH; ++i) {
+
         // Embedding
-        int ei = input->buf[n * MAX_LENGTH + i];
-        embedding(ei, eW_emb, encoder_embedded);
-        
+        // int ei = input->buf[n * MAX_LENGTH + i];
+        // embedding(ei, eW_emb, encoder_embedded);
+
+        int *eis = (int *) malloc(sizeof(int) * BATCH_SIZE);
+        for (int batch_idx=0; batch_idx<BATCH_SIZE; batch_idx++) {
+          eis[batch_idx] = input->buf[n * BATCH_SIZE + batch_idx * MAX_LENGTH + i];
+        }
+
+        // for (int batch_idx=0; batch_idx<BATCH_SIZE; batch_idx++) {
+        //   cout << eis[batch_idx] << " ";
+        // }
+        // cout << endl;
+
+        embedding(eis, eW_emb, encoder_embedded);
+        // cout << "encoder_embedded: " << encoder_embedded->num_elem() << endl;
+
+
+        Tensor *encoder_embedded_part = new Tensor({256});
+        for (int ee=0; ee<encoder_embedded_part->num_elem(); ee++) {
+          encoder_embedded_part->buf[ee] = encoder_embedded->buf[ee];
+        }
+
         // GRU
         // r_t
-        matvec(encoder_embedded, eW_ir, encoder_rtmp1);
-        elemwise_add(encoder_rtmp1, eb_ir, encoder_rtmp2);
+        matvec_batch_memcpy(encoder_embedded, eW_ir, encoder_rtmp1);
+
+        Tensor *encoder_rtmp1_part = new Tensor({256});
+        for (int ee=0; ee<encoder_rtmp1_part->num_elem(); ee++) {
+          encoder_rtmp1_part->buf[ee] = encoder_rtmp1->buf[ee];
+        }
+
+        // encoder_rtmp1_part->print();
+
+        elemwise_add(encoder_rtmp1_part, eb_ir, encoder_rtmp2);
         matvec(encoder_hidden, eW_hr, encoder_rtmp3);
         elemwise_add(encoder_rtmp3, eb_hr, encoder_rtmp4);
         elemwise_add(encoder_rtmp2, encoder_rtmp4, encoder_rtmp5);
         elemwise_sigmoid(encoder_rtmp5, encoder_rt); 
-        
+
+
         // z_t
-        matvec(encoder_embedded, eW_iz, encoder_ztmp1);
+        matvec(encoder_embedded_part, eW_iz, encoder_ztmp1);
         elemwise_add(encoder_ztmp1, eb_iz, encoder_ztmp2);
         matvec(encoder_hidden, eW_hz, encoder_ztmp3);
         elemwise_add(encoder_ztmp3, eb_hz, encoder_ztmp4);
         elemwise_add(encoder_ztmp2, encoder_ztmp4, encoder_ztmp5);
         elemwise_sigmoid(encoder_ztmp5, encoder_zt); 
-       
+
         // n_t
-        matvec(encoder_embedded, eW_in, encoder_ntmp1);
+        matvec(encoder_embedded_part, eW_in, encoder_ntmp1);
         elemwise_add(encoder_ntmp1, eb_in, encoder_ntmp2);
         matvec(encoder_hidden, eW_hn, encoder_ntmp3);
         elemwise_add(encoder_ntmp3, eb_hn, encoder_ntmp4);
         elemwise_mult(encoder_rt, encoder_ntmp4, encoder_ntmp5);
         elemwise_add(encoder_ntmp2, encoder_ntmp5, encoder_ntmp6);
         elemwise_tanh(encoder_ntmp6, encoder_nt); 
-        
+
         // h_t
         elemwise_oneminus(encoder_zt, encoder_htmp1);
         elemwise_mult(encoder_htmp1, encoder_nt, encoder_htmp2);
         elemwise_mult(encoder_zt, encoder_hidden, encoder_htmp3);
         elemwise_add(encoder_htmp2, encoder_htmp3, encoder_hidden);
-        
-        copy_encoder_outputs(encoder_hidden, encoder_outputs, i);
+
+        if (i == lengths[0] - 1) {
+          cout << i << endl;
+          for (int dh=0; dh<encoder_hidden->num_elem(); dh++) {
+            decoder_hidden->buf[dh] = encoder_hidden->buf[dh];
+          }
+        }
+        // decoder_hidden->print();
+
+        copy_encoder_outputs(encoder_hidden, encoder_outputs, i, lengths[0]);
+        // cout << encoder_outputs->num_elem() << endl;
       } // end Encoder loop
+
       
+
       // Decoder init
-      decoder_hidden = encoder_hidden;
-      decoder_input->buf[0] = SOS_token; 
-      int di = (int)decoder_input->buf[0];
-     
+      // decoder_hidden = encoder_hidden;
+      decoder_input->buf[0] = SOS_token;
+
+      int *dis = (int *) malloc(sizeof(int) * BATCH_SIZE);
+      for (int batch_idx=0; batch_idx<BATCH_SIZE; batch_idx++) {
+          dis[batch_idx] = (int)decoder_input->buf[0];
+        }
+      
+
       // Decoder
       for (int i=0; i<MAX_LENGTH; ++i) {
-        
+
         // Embedding
-        embedding(di, dW_emb, decoder_embedded);
+        embedding(dis, dW_emb, decoder_embedded);
+
+        Tensor *decoder_embedded_part = new Tensor({256});
+        for (int ee=0; ee<decoder_embedded_part->num_elem(); ee++) {
+          decoder_embedded_part->buf[ee] = decoder_embedded->buf[ee];
+        }
 
         // Attention
-        concat(decoder_embedded, decoder_hidden, decoder_embhid);
+        concat(decoder_embedded_part, decoder_hidden, decoder_embhid);
         linear(decoder_embhid, dW_attn, db_attn, decoder_attn);
         softmax(decoder_attn, decoder_attn_weights);
         bmm(decoder_attn_weights, encoder_outputs, decoder_attn_applied);
-        concat(decoder_embedded, decoder_attn_applied, decoder_embattn);
+        concat(decoder_embedded_part, decoder_attn_applied, decoder_embattn);
         linear(decoder_embattn, dW_attn_comb, db_attn_comb, decoder_attn_comb);
         relu(decoder_attn_comb, decoder_relu);
-      
+
         // GRU
         // r_t
         matvec(decoder_relu, dW_ir, decoder_rtmp1);
@@ -212,7 +300,7 @@ void translator(Tensor *input, Tensor *output, int N){
         elemwise_add(decoder_rtmp3, db_hr, decoder_rtmp4);
         elemwise_add(decoder_rtmp2, decoder_rtmp4, decoder_rtmp5);
         elemwise_sigmoid(decoder_rtmp5, decoder_rt); 
-        
+
         // z_t
         matvec(decoder_relu, dW_iz, decoder_ztmp1);
         elemwise_add(decoder_ztmp1, db_iz, decoder_ztmp2);
@@ -220,7 +308,7 @@ void translator(Tensor *input, Tensor *output, int N){
         elemwise_add(decoder_ztmp3, db_hz, decoder_ztmp4);
         elemwise_add(decoder_ztmp2, decoder_ztmp4, decoder_ztmp5);
         elemwise_sigmoid(decoder_ztmp5, decoder_zt); 
-        
+
         // n_t
         matvec(decoder_relu, dW_in, decoder_ntmp1);
         elemwise_add(decoder_ntmp1, db_in, decoder_ntmp2);
@@ -229,21 +317,21 @@ void translator(Tensor *input, Tensor *output, int N){
         elemwise_mult(decoder_rt, decoder_ntmp4, decoder_ntmp5);
         elemwise_add(decoder_ntmp2, decoder_ntmp5, decoder_ntmp6);
         elemwise_tanh(decoder_ntmp6, decoder_nt); 
-        
+
         // h_t
         elemwise_oneminus(decoder_zt, decoder_htmp1);
         elemwise_mult(decoder_htmp1, decoder_nt, decoder_htmp2);
         elemwise_mult(decoder_zt, decoder_hidden, decoder_htmp3);
         elemwise_add(decoder_htmp2, decoder_htmp3, decoder_hidden);
-       
+
         // Select output token
         linear(decoder_hidden, dW_out, db_out, decoder_out);
         log_softmax(decoder_out, decoder_logsoftmax);
         int topi= top_one(decoder_logsoftmax);
-         
+
         if (topi != EOS_token) {
           output->buf[n * MAX_LENGTH + i] = topi;
-          di = topi;
+          dis[0] = topi;
         }
         else {
           output->buf[n * MAX_LENGTH + i] = EOS_token;
@@ -262,11 +350,13 @@ void translator(Tensor *input, Tensor *output, int N){
  * @param [in2] weight : a matrix of size [M x H_]
  * @param [out] output : a vector of size [H_]
  */
-void embedding(int ei, Tensor *weight, Tensor *output){
+void embedding(int *ei, Tensor *weight, Tensor *output){
   int H_ = weight->shape[1];
-  
-  for (int h=0; h<H_; ++h) {
-    output->buf[h] = weight->buf[ei * H_ + h];
+
+  for (int batch_idx=0; batch_idx<BATCH_SIZE; batch_idx++) {
+    for (int h=0; h<H_; ++h) {
+      output->buf[batch_idx * H_ + h] = weight->buf[ei[batch_idx] * H_ + h];
+    }
   }
 }
 
@@ -281,7 +371,7 @@ void embedding(int ei, Tensor *weight, Tensor *output){
 void matvec(Tensor *input, Tensor *weight, Tensor *output) {
   int M_ = weight->shape[0];
   int K_ = weight->shape[1];
-  
+
   for (int m=0; m<M_; ++m) {
     float c = 0.0;
     for (int k=0; k<K_; ++k) {
@@ -293,6 +383,85 @@ void matvec(Tensor *input, Tensor *weight, Tensor *output) {
   }
 }
 
+__global__ void bmm_kernel(float *mat_1, float *mat_2, float *mat_3, int b,
+                           int m, int n, int p) {
+
+    // printf("%d, %d, %d, %d\n", b, m, n, p);
+    // 2D block and 2D thread
+    // Each thread computes one cell in mat_3.
+    const int i = blockIdx.y * blockDim.y + threadIdx.y;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    const int l = blockIdx.z;
+
+    // Do not process outside the matrix.
+    // Do not forget the equal sign!
+    if ((i >= m) || (j >= p))
+    {
+        return;
+    }
+
+    float acc_sum = 0.0;
+    for (int k=0; k < n; ++k)
+    {
+        acc_sum += mat_1[i * n + k] * mat_2[l * n * p + k * p + j];
+        // acc_sum += mat_1[0] * mat_2[0];
+    }
+    // printf("%f", acc_sum);
+    mat_3[l * m * p + i * p + j] = acc_sum;
+}
+
+void matvec_batch_memcpy(Tensor *input, Tensor *weight, Tensor *output) {
+
+  int NUM_GPUS;
+  cudaGetDeviceCount(&NUM_GPUS);
+  cudaCheckError()
+
+  // int M_ = weight->shape[0];
+  // int K_ = weight->shape[1];
+
+  unsigned int memsize_A = sizeof(float) * weight->shape[0] * weight->shape[1];
+  unsigned int memsize_B = sizeof(float) * input->shape[0] * input->shape[1] * input->shape[2];
+  unsigned int memsize_C = sizeof(float) * output->shape[0] * output->shape[1] * output->shape[2];
+
+
+  cudaMalloc((void**)&weight->bufgpu, memsize_A);
+  cudaCheckError()
+  cudaMalloc((void**)&input->bufgpu, memsize_B);
+  cudaCheckError()
+  cudaMalloc((void**)&output->bufgpu, memsize_C);
+  cudaCheckError()
+
+  
+  cout << "input: " << input->num_elem() << endl;
+  cout << "weight: " << weight->num_elem() << endl;
+  cout << "output: " << output->num_elem() << endl;
+
+  cudaMemcpy(weight->bufgpu, weight->buf, memsize_A, cudaMemcpyHostToDevice);
+  cudaCheckError()
+  cudaMemcpy(input->bufgpu, input->buf, memsize_B, cudaMemcpyHostToDevice);
+  cudaCheckError()
+
+  int BLOCK_DIM = 1;
+  dim3 blocksize(BLOCK_DIM, BLOCK_DIM);
+  dim3 gridsize(0, 0, 0);
+  gridsize.x = (input->shape[1] + BLOCK_DIM - 1) / BLOCK_DIM;
+  gridsize.y = (weight->shape[0] + BLOCK_DIM - 1) / BLOCK_DIM;
+  gridsize.z = BATCH_SIZE;
+
+  bmm_kernel<<<gridsize, blocksize>>>(weight->bufgpu, input->bufgpu, output->bufgpu, 
+                                      BATCH_SIZE, weight->shape[0], weight->shape[1], input->shape[2]);
+
+  cudaMemcpy(output->buf, output->bufgpu, memsize_C, cudaMemcpyDeviceToHost);
+  cudaCheckError()
+
+  // cudaFree(d_A);
+  // cudaCheckError()
+  // cudaFree(d_B);
+  // cudaCheckError()
+  // cudaFree(d_C);
+  // cudaCheckError()
+}
+
 /*
  * elemwise_add
  * @brief : Element-by-element addition of tensors
@@ -301,54 +470,21 @@ void matvec(Tensor *input, Tensor *weight, Tensor *output) {
  * @param [in2] input2
  * @param [out] output
  */
-__global__ void elemwise_add_kernel(float* input1, float* input2, float* output, int N) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < N) {
-    output[idx] = input1[idx] + input2[idx];
-    // printf("%f", output[idx]);
+void elemwise_add(Tensor *input1, Tensor *input2, Tensor *output){
+  int N_ = input1->num_elem();
+
+  for (int n=0; n<N_; ++n) {
+    output->buf[n] = input1->buf[n] + input2->buf[n];
   }
 }
 
-void elemwise_add(Tensor* input1, Tensor* input2, Tensor* output) {
-  int N = input1->num_elem();
-  int NUM_GPUS;
-  cudaGetDeviceCount(&NUM_GPUS);
+void elemwise_add_batch(Tensor *input1, Tensor *input2, Tensor *output){
+  int N_ = input1->num_elem();
 
-  // Allocate GPU memory
-  float* d_input1;
-  float* d_input2;
-  float* d_output;
-  cudaMalloc((void**)&d_input1, N * sizeof(float));
-  cudaMalloc((void**)&d_input2, N * sizeof(float));
-  cudaMalloc((void**)&d_output, N * sizeof(float));
-
-  // Copy input tensors from CPU to GPU
-  cudaMemcpy(d_input1, input1->buf, N * sizeof(float), cudaMemcpyHostToDevice);
-  cudaCheckError();
-  cudaMemcpy(d_input2, input2->buf, N * sizeof(float), cudaMemcpyHostToDevice);
-  cudaCheckError();
-
-  // Launch CUDA kernel
-  int block_size = 256;
-  int num_blocks = (N + block_size - 1) / block_size;
-  elemwise_add_kernel<<<num_blocks, block_size>>>(d_input1, d_input2, d_output, N);
-
-  // Copy the result back from GPU to CPU
-  cudaMemcpy(output->buf, d_output, N * sizeof(float), cudaMemcpyDeviceToHost);
-
-  // Free GPU memory
-  cudaFree(d_input1);
-  cudaFree(d_input2);
-  cudaFree(d_output);
+  for (int n=0; n<N_; ++n) {
+    output->buf[n] = input1->buf[n] + input2->buf[n];
+  }
 }
-
-// void elemwise_add(Tensor *input1, Tensor *input2, Tensor *output){
-//   int N_ = input1->num_elem();
-  
-//   for (int n=0; n<N_; ++n) {
-//     output->buf[n] = input1->buf[n] + input2->buf[n];
-//   }
-// }
 
 /*
  * elemwise_sigmoid
@@ -359,7 +495,7 @@ void elemwise_add(Tensor* input1, Tensor* input2, Tensor* output) {
  */
 void elemwise_sigmoid(Tensor *input, Tensor *output) {
   int N_ = input->num_elem();
-  
+
   for (int n=0; n<N_; ++n) {
     float x = input->buf[n];
     output->buf[n] = 1.0 / (1.0 + expf(-x));
@@ -375,7 +511,7 @@ void elemwise_sigmoid(Tensor *input, Tensor *output) {
  */
 void elemwise_tanh(Tensor *input, Tensor *output) {
   int N_ = input->num_elem();
-  
+
   for (int n=0; n<N_; ++n) {
     float x = input->buf[n];
     output->buf[n] = tanhf(x);
@@ -392,7 +528,7 @@ void elemwise_tanh(Tensor *input, Tensor *output) {
  */
 void elemwise_mult(Tensor *input1, Tensor *input2, Tensor *output) {
   int N_ = input1->num_elem();
-  
+
   for (int n=0; n<N_; ++n) {
     float x1 = input1->buf[n];
     float x2 = input2->buf[n];
@@ -409,7 +545,7 @@ void elemwise_mult(Tensor *input1, Tensor *input2, Tensor *output) {
  */
 void elemwise_oneminus(Tensor *input, Tensor *output) {
   int N_ = input->num_elem();
-  
+
   for (int n=0; n<N_; ++n) {
     float x = input->buf[n];
     output->buf[n] = 1.0 - x;
@@ -424,12 +560,15 @@ void elemwise_oneminus(Tensor *input, Tensor *output) {
  * @param [in2] i      : row index
  * @param [out] output : a matrix of size [MAX_LENGTH x N_]
  */
-void copy_encoder_outputs(Tensor *input, Tensor *output, int i) {
+void copy_encoder_outputs(Tensor *input, Tensor *output, int i, int len) {
   int N_ = input->num_elem();
-  
-  for (int n=0; n<N_; ++n) {
-    output->buf[i * HIDDEN_SIZE + n] = input->buf[n];
+
+  if (i < len) {
+    for (int n=0; n<N_; ++n) {
+      output->buf[i * HIDDEN_SIZE + n] = input->buf[n];
+    }
   }
+  
 }
 
 /*
@@ -442,7 +581,7 @@ void copy_encoder_outputs(Tensor *input, Tensor *output, int i) {
  */
 void concat(Tensor *input1, Tensor *input2, Tensor *output) {
   int N_ = input1->num_elem();
-  
+
   for (int n=0; n<N_; ++n) {
     output->buf[n] = input1->buf[n];
   }
@@ -460,64 +599,18 @@ void concat(Tensor *input1, Tensor *input2, Tensor *output) {
  * @param [in3] bias   : a vector of size [N_]
  * @param [out] output : a vector of size [N_]
  */
+void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
+  int K_ = weight->shape[1];
+  int N_ = weight->shape[0];
 
-__global__ void linear_kernel(float* input, float* weight, float* bias, float* output, int N, int K) {
-  int n = blockIdx.x * blockDim.x + threadIdx.x;
-  if (n < N) {
-    float c = bias[n];
-    for (int k = 0; k < K; ++k) {
-      c += input[k] * weight[n * K + k];
+  for (int n=0; n<N_; ++n) {
+    float c = bias->buf[n];
+    for (int k=0; k<K_; ++k) {
+      c += input->buf[k] * weight->buf[n*K_ + k]; 
     }
-    output[n] = c;
+    output->buf[n] = c;
   }
 }
-
-void linear(Tensor* input, Tensor* weight, Tensor* bias, Tensor* output) {
-  int N = weight->shape[0];
-  int K = weight->shape[1];
-
-  // Allocate GPU memory
-  float* d_input;
-  float* d_weight;
-  float* d_bias;
-  float* d_output;
-  cudaMalloc((void**)&d_input, K * sizeof(float));
-  cudaMalloc((void**)&d_weight, N * K * sizeof(float));
-  cudaMalloc((void**)&d_bias, N * sizeof(float));
-  cudaMalloc((void**)&d_output, N * sizeof(float));
-
-  // Copy input tensors from CPU to GPU
-  cudaMemcpy(d_input, input->buf, K * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_weight, weight->buf, N * K * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_bias, bias->buf, N * sizeof(float), cudaMemcpyHostToDevice);
-
-  // Launch CUDA kernel
-  int block_size = 256;
-  int num_blocks = (N + block_size - 1) / block_size;
-  linear_kernel<<<num_blocks, block_size>>>(d_input, d_weight, d_bias, d_output, N, K);
-
-  // Copy the result back from GPU to CPU
-  cudaMemcpy(output->buf, d_output, N * sizeof(float), cudaMemcpyDeviceToHost);
-
-  // Free GPU memory
-  cudaFree(d_input);
-  cudaFree(d_weight);
-  cudaFree(d_bias);
-  cudaFree(d_output);
-}
-
-// void linear(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
-//   int K_ = weight->shape[1];
-//   int N_ = weight->shape[0];
-  
-//   for (int n=0; n<N_; ++n) {
-//     float c = bias->buf[n];
-//     for (int k=0; k<K_; ++k) {
-//       c += input->buf[k] * weight->buf[n*K_ + k]; 
-//     }
-//     output->buf[n] = c;
-//   }
-// }
 
 /*
  * softmax
@@ -531,7 +624,7 @@ void linear(Tensor* input, Tensor* weight, Tensor* bias, Tensor* output) {
 void softmax(Tensor *input, Tensor *output) {
   int N_ = input->shape[0];
   float sum = 0.0;
-  
+
   for (int n=0; n<N_; ++n) {
     sum += expf(input->buf[n]);
   }
@@ -552,7 +645,7 @@ void softmax(Tensor *input, Tensor *output) {
 void bmm(Tensor *input, Tensor *weight, Tensor *output) {
   int K_ = weight->shape[0];
   int N_ = weight->shape[1];
-  
+
   for (int n=0; n<N_; ++n) {
     float c = 0.0;
     for (int k=0; k<K_; ++k) {
@@ -571,7 +664,7 @@ void bmm(Tensor *input, Tensor *weight, Tensor *output) {
  */
 void relu(Tensor *input, Tensor *output) {
   int N_ = input->num_elem();
-  
+
   for (int n=0; n<N_; ++n) {
     float x = input->buf[n];
     if (x < 0.0) output->buf[n] = 0.0;
@@ -590,7 +683,7 @@ int top_one(Tensor *input) {
   int N_ = input->num_elem();
   int topi = 0;
   float topval = input->buf[0];
-  
+
   for (int n=1; n<N_; ++n) {
     float x = input->buf[n];    
     if (x >= topval) {
@@ -611,7 +704,7 @@ int top_one(Tensor *input) {
 void log_softmax(Tensor *input, Tensor *output) {
   int N_ = input->shape[0];
   float sum = 0.0;
-  
+
   for (int n=0; n<N_; ++n) {
     sum += expf(input->buf[n]);
   }
@@ -632,7 +725,7 @@ void initialize_translator(const char *parameter_fname, int N){
   if (mpi_rank == 0) {
     size_t parameter_binary_size = 0;
     float *parameter = (float *) read_binary(parameter_fname, &parameter_binary_size);
-    
+
     eW_emb = new Tensor({INPUT_VOCAB_SIZE, HIDDEN_SIZE}, parameter + OFFSET0);
     eW_ir = new Tensor({HIDDEN_SIZE, HIDDEN_SIZE}, parameter + OFFSET1);
     eW_iz = new Tensor({HIDDEN_SIZE, HIDDEN_SIZE}, parameter + OFFSET2);
@@ -666,10 +759,40 @@ void initialize_translator(const char *parameter_fname, int N){
     dW_out = new Tensor({OUTPUT_VOCAB_SIZE, HIDDEN_SIZE}, parameter + OFFSET30);
     db_out = new Tensor({OUTPUT_VOCAB_SIZE}, parameter + OFFSET31);
 
+    cudaMalloc((void**)&eW_emb->bufgpu, sizeof(float) * INPUT_VOCAB_SIZE * HIDDEN_SIZE);
+    cudaMalloc((void**)&eW_ir->bufgpu, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE);
+    cudaMalloc((void**)&eW_iz->bufgpu, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE);
+    cudaMalloc((void**)&eW_in->bufgpu, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE);
+    cudaMalloc((void**)&eW_hr->bufgpu, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE);
+    cudaMalloc((void**)&eW_hz->bufgpu, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE);
+    cudaMalloc((void**)&eW_hn->bufgpu, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE);
+    cudaMalloc((void**)&eb_ir->bufgpu, sizeof(float) * HIDDEN_SIZE);
+    cudaMalloc((void**)&eb_iz->bufgpu, sizeof(float) * HIDDEN_SIZE);
+    cudaMalloc((void**)&eb_in->bufgpu, sizeof(float) * HIDDEN_SIZE);
+    cudaMalloc((void**)&eb_hr->bufgpu, sizeof(float) * HIDDEN_SIZE);
+    cudaMalloc((void**)&eb_hz->bufgpu, sizeof(float) * HIDDEN_SIZE);
+    cudaMalloc((void**)&eb_hn->bufgpu, sizeof(float) * HIDDEN_SIZE);
+
+    cudaMemcpy(eW_emb->bufgpu, eW_emb->buf, sizeof(float) * INPUT_VOCAB_SIZE * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eW_ir->bufgpu, eW_ir->buf, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eW_iz->bufgpu, eW_iz->buf, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eW_in->bufgpu, eW_in->buf, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eW_hr->bufgpu, eW_hr->buf, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eW_hz->bufgpu, eW_hz->buf, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eW_hn->eW_hn, eW_emb->buf, sizeof(float) * HIDDEN_SIZE * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eb_ir->eb_ir, eW_emb->buf, sizeof(float) * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eb_iz->eb_iz, eW_emb->buf, sizeof(float) * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eb_in->eb_in, eW_emb->buf, sizeof(float) * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eb_hr->eb_hr, eW_emb->buf, sizeof(float) * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eb_hz->eb_hz, eW_emb->buf, sizeof(float) * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+    cudaMemcpy(eb_hn->eb_hn, eW_emb->buf, sizeof(float) * HIDDEN_SIZE, cudaMemcpyHostToDevice);
+
+
+
     encoder_hidden = new Tensor({HIDDEN_SIZE});
     encoder_outputs = new Tensor({MAX_LENGTH, HIDDEN_SIZE});
-    encoder_embedded = new Tensor({HIDDEN_SIZE});
-    encoder_rtmp1 = new Tensor({HIDDEN_SIZE});
+    encoder_embedded = new Tensor({BATCH_SIZE, HIDDEN_SIZE, 1});
+    encoder_rtmp1 = new Tensor({BATCH_SIZE, HIDDEN_SIZE, 1});
     encoder_rtmp2 = new Tensor({HIDDEN_SIZE});
     encoder_rtmp3 = new Tensor({HIDDEN_SIZE});
     encoder_rtmp4 = new Tensor({HIDDEN_SIZE});
@@ -693,11 +816,35 @@ void initialize_translator(const char *parameter_fname, int N){
     encoder_htmp3 = new Tensor({HIDDEN_SIZE});
     encoder_ht = new Tensor({HIDDEN_SIZE});
 
+    cudaMalloc((void**)&encoder_embedded->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_rtmp1->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_rtmp2->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_rtmp3->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_rtmp4->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_rtmp5->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_rt->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ztmp1->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ztmp2->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ztmp3->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ztmp4->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ztmp5->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_zt->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ntmp1->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ntmp2->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ntmp3->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ntmp4->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ntmp5->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_nt->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_htmp1->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_htmp2->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_htmp3->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+    cudaMalloc((void**)&encoder_ht->bufgpu, sizeof(float) * BATCH_SIZE * HIDDEN_SIZE * 1);
+
     decoder_input = new Tensor({MAX_LENGTH});
     decoder_hidden = new Tensor({HIDDEN_SIZE});
     decoder_output = new Tensor({HIDDEN_SIZE});
     decoded_words = new Tensor({MAX_LENGTH});
-    decoder_embedded = new Tensor({HIDDEN_SIZE});
+    decoder_embedded = new Tensor({BATCH_SIZE, HIDDEN_SIZE});
     decoder_embhid = new Tensor({2 * HIDDEN_SIZE});
     decoder_attn = new Tensor({MAX_LENGTH});
     decoder_attn_weights = new Tensor ({MAX_LENGTH});
